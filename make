@@ -49,7 +49,7 @@ extract_openwrt() {
             break
             ;;
         gz)
-            if (ls $firmware | grep -q ".tar.gz$"); then
+            if ls $firmware | grep -q ".tar.gz$"; then
                 tar -xzf $firmware -C $root_comm
                 break
             else
@@ -63,7 +63,9 @@ extract_openwrt() {
         img)
             loop_setup $firmware
             if ! mount -r ${loop}p2 $mount; then
-                die "mount ${loop}p2 failed!"
+                if ! mount -r ${loop}p1 $mount; then
+                    die "mount ${loop} failed!"
+                fi
             fi
             cp -r $mount/* $root_comm && sync
             umount -f $mount
@@ -96,10 +98,10 @@ extract_armbian() {
 
     mkdir -p $root $boot
 
-    tar -xzf "$kernel_dir/../../boot-common.tar.gz" -C $boot
-    tar -xzf "$kernel_dir/kernel.tar.gz" -C $boot
-    tar -xzf "$kernel_dir/../../firmware.tar.gz" -C $root
-    tar -xzf "$kernel_dir/modules.tar.gz" -C $root
+    tar -xJf "./armbian/boot-common.tar.xz" -C $boot
+    tar -xJf "$kernel_dir/kernel.tar.xz" -C $boot
+    tar -xJf "./armbian/firmware.tar.xz" -C $root
+    tar -xJf "$kernel_dir/modules.tar.xz" -C $root
 
     cp -r $root_comm/* $root
     [ $(ls $root_dir | wc -w) != 0 ] && cp -r $root_dir/* $root
@@ -113,7 +115,10 @@ utils() {
 
         echo 'pwm_meson' > etc/modules.d/pwm-meson
         if ! grep -q 'ulimit -n' etc/init.d/boot; then
-            sed -i '/kmodloader/i\\tulimit -n 51200\n' etc/init.d/boot
+            sed -i '/kmodloader/i \\tulimit -n 51200\n' etc/init.d/boot
+        fi
+        if ! grep -q '/tmp/upgrade' etc/init.d/boot; then
+            sed -i '/mkdir -p \/tmp\/.uci/a \\tmkdir -p \/tmp\/upgrade' etc/init.d/boot
         fi
         sed -i 's/ttyAMA0/ttyAML0/' etc/inittab
         sed -i 's/ttyS0/tty0/' etc/inittab
@@ -141,6 +146,8 @@ format_image() {
 }
 
 copy2image() {
+    set -e
+
     local bootfs="$mount/$kernel/bootfs"
     local rootfs="$mount/$kernel/rootfs"
 
@@ -163,7 +170,6 @@ copy2image() {
 get_firmwares() {
     firmwares=()
     i=0
-    IFS_old=$IFS
     IFS=$'\n'
 
     [ -d "./openwrt" ] && {
@@ -171,13 +177,11 @@ get_firmwares() {
             firmwares[i++]=$x
         done
     }
-    IFS=$IFS_old
 }
 
 get_kernels() {
     kernels=()
     i=0
-    IFS_old=$IFS
     IFS=$'\n'
 
     local kernel_root="./armbian/$device/kernel"
@@ -185,15 +189,14 @@ get_kernels() {
         work=$(pwd)
         cd $kernel_root
         for x in $(ls ./); do
-            [[ -f "$x/kernel.tar.gz" && -f "$x/modules.tar.gz" ]] && kernels[i++]=$x
+            [[ -f "$x/kernel.tar.xz" && -f "$x/modules.tar.xz" ]] && kernels[i++]=$x
         done
         cd $work
     }
-    IFS=$IFS_old
 }
 
 show_kernels() {
-    if ((${#kernels[*]} == 0)); then
+    if [ ${#kernels[*]} = 0 ]; then
         die "no file in kernel directory!"
     else
         show_list "${kernels[*]}" "kernel"
@@ -224,16 +227,15 @@ choose_kernel() {
 
 choose_files() {
     local len=$1
-    opt=
 
-    if ((len == 1)); then
+    if [ "$len" = 1 ]; then
         opt=0
     else
         i=0
         while true; do
             echo && read -p " select $2 above, and press Enter to select the first one: " opt
             [ $opt ] || opt=1
-            if ((opt >= 1 && opt <= len)) 2>/dev/null; then
+            if [[ "$opt" -ge 1 && "$opt" -le "$len" ]]; then
                 let opt--
                 break
             else
@@ -253,7 +255,7 @@ set_rootsize() {
         read -p " input the rootfs partition size, defaults to 512m, do not less than 256m
  if you don't know what this means, press Enter to keep default: " rootsize
         [ $rootsize ] || rootsize=512
-        if ((rootsize >= 256)) 2>/dev/null; then
+        if [[ "$rootsize" -ge 256 ]]; then
             tag $rootsize && echo
             break
         else
@@ -266,17 +268,24 @@ set_rootsize() {
 
 usage() {
     cat <<EOF
-
 Usage:
   make [option]
 
 Options:
-  -c, --clean           clean up the output and temporary directories
-  -d, --default         use the default configuration, which means that use the first firmware in the "openwrt" directory, the kernel version is "all", and the rootfs partition size is 512m
-  -k=VERSION            set the kernel version, which must be in the "kernel" directory, set to "all" will build all the kernel version
-  --kernel              show all kernel version in "kernel" directory
-  -s, --size=SIZE       set the rootfs partition size, do not less than 256m
-  -h, --help            display this help
+  -c, --clean       clean up the output and temporary directories
+
+  -d, --default     use the default configuration, which means that use the first firmware in the "openwrt" directory, \
+the kernel version is "all", and the rootfs partition size is 512m
+
+  -k=VERSION        set the kernel version, which must be in the "kernel" directory
+     , -k all       build all the kernel version
+     , -k latest    build the latest kernel version
+
+  --kernel          show all kernel version in "kernel" directory
+
+  -s, --size=SIZE   set the rootfs partition size, do not less than 256m
+
+  -h, --help        display this help
 
 EOF
 }
@@ -307,7 +316,10 @@ while [ "$1" ]; do
     -k)
         kernel=$2
         kernel_dir="./armbian/$device/kernel/$kernel"
-        if [ $kernel = "all" ] 2>/dev/null || [ -f "$kernel_dir/kernel.tar.gz" ]; then
+        if [[ "$kernel" = "all" || -f "$kernel_dir/kernel.tar.xz" ]]; then
+            shift
+        elif [ "$kernel" = "latest" ]; then
+            kernel="${kernels[-1]}"
             shift
         else
             die "invalid kernel [ $2 ]!!"
@@ -318,7 +330,7 @@ while [ "$1" ]; do
         ;;
     -s | --size)
         rootsize=$2
-        if ((rootsize >= 256)) 2>/dev/null; then
+        if [[ "$rootsize" -ge 256 ]]; then
             shift
         else
             die "invalid size [ $2 ]!!"
@@ -331,10 +343,10 @@ while [ "$1" ]; do
     shift
 done
 
-if ((${#firmwares[*]} == 0)); then
+if [ ${#firmwares[*]} = 0 ]; then
     die "no file in openwrt directory!"
 fi
-if ((${#kernels[*]} == 0)); then
+if [ ${#kernels[*]} = 0 ]; then
     die "no file in kernel directory!"
 fi
 
